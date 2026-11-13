@@ -1,0 +1,26 @@
+[project]
+name = "multi-agent-system"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "RASHWANTH2005", email = "kprashwanth005@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai>=2.34.0",
+    "langchain>=1.4.7",
+    "langchain-google-genai>=4.4.2",
+    "langchain-mcp-adapters>=0.3.1",
+    "langfuse>=5.1.0",
+    "langgraph>=1.2.18",
+    "mcp[cli]<2",
+    "python-dotenv>=1.2.4",
+]
+
+[project.scripts]
+multi-agent-system = "multi_agent_system:main"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
