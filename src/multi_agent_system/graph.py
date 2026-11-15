@@ -12,7 +12,9 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langgraph.prebuilt import ToolNode, tools_condition
 
-
+import operator
+from typing import Annotated, Literal
+from langgraph.types import Command
 from multi_agent_system.client import get_tools
 
 load_dotenv()
@@ -23,6 +25,12 @@ langfuse_handler = CallbackHandler()
 
 # print(langfuse.auth_check())
 
+Step = Literal["planner", "researcher", "critic", "writer"]
+MAX_STEPS = 20
+
+class Route(BaseModel):
+    next: Step
+    reason: str = Field(description="One sentence citing specific facts from the state")
 
 class Plan(BaseModel):
     sub_questions: list[str] = Field(
@@ -45,6 +53,8 @@ class State(MessagesState):
     report: str | None
     critique: str | None
     iterations: int = 0
+    steps: int
+    decisions: Annotated[list[dict], operator.add]
 
 PLAN_PROMPT = (
     "Break the user's question into 2 specific, researchable sub-questions. "
@@ -59,13 +69,42 @@ RESEARCH_PROMPT = (
 EXTRACT_PROMPT = (
     "From the research above, extract findings as claim + source_url. "
     "For each finding, include the sub-question index it addresses. "
-    "Only use URLs that appear in the conversation."
+    "Use zero-based indexing: first sub-question = 0, second = 1. "
+    "Only use URLs that appear in the conversation. "
+    "Do not invent claims or source URLs."
 )
 WRITE_PROMPT = (
     "Write a concise report. Use ONLY the findings provided. "
     "2 detailed summaray is enough. "
     "Cite the URL after each summary. If the findings don't cover something, say so."
+    "if no findings were collected, say so."
 )   
+SUPERVISOR_PROMPT = (
+    "You route a research pipeline. Choose the next step from the allowed list.\n"
+    "- researcher: the plan is fine but evidence is missing or weak.\n"
+    "- planner: the sub-questions themselves are too vague or wrong.\n"
+    "- writer: remaining gaps can't reasonably be fixed; the report will state them.\n"
+    "Your reason must cite specific facts from the status."
+)
+
+
+
+def allowed_steps(state: State) -> list[str]:
+    if not state.get("plan"):             return ["planner"]
+    if not state.get("findings"):         return ["researcher"]
+    if state.get("critique") is None:     return ["critic"]
+    if state["critique"] == "passed":     return ["writer"]
+    return ["researcher", "planner", "writer"]   # critic found problems: real choice
+
+def status(state: State) -> str:
+    plan, fnd = state.get("plan"), state.get("findings")
+    n_src = len({f.source_url for f in fnd.findings}) if fnd else 0
+    return (
+        f"sub-questions: {len(plan.sub_questions) if plan else 0}\n"
+        f"claims: {len(fnd.findings) if fnd else 0} from {n_src} distinct sources\n"
+        f"critic says: {state.get('critique') or 'passed'}\n"
+        f"steps used: {state.get('steps', 0)} of {MAX_STEPS}"
+    )
 
 async def build_graph():
     tools = await get_tools()
@@ -74,6 +113,34 @@ async def build_graph():
     llm_with_tools = llm.bind_tools(tools)
     extractor = llm.with_structured_output(Findings)
     writer_chain = llm | StrOutputParser()
+    router = llm.with_structured_output(Route)
+
+
+    async def supervisor(state: State, config: RunnableConfig) -> Command[Step]:
+        steps = state.get("steps", 0)
+        allowed = allowed_steps(state)
+
+        if steps >= MAX_STEPS:
+            choice, reason = "writer", "step budget exhausted; writing with known gaps"
+        elif len(allowed) == 1:
+            choice, reason = allowed[0], "only valid next step"
+        else:
+            route = await router.ainvoke(
+                [SystemMessage(SUPERVISOR_PROMPT),
+                HumanMessage(f"Question: {state['messages'][0].content}\n\n"
+                            f"Status: {status(state)}\n\nAllowed: {allowed}")],
+                config,
+            )
+            if route.next in allowed:
+                choice, reason = route.next, route.reason
+            else:
+                choice, reason = allowed[0], f"overrode invalid choice '{route.next}'"
+
+        return Command(
+            goto=choice,
+            update={"steps": steps + 1,
+                    "decisions": [{"step": choice, "reason": reason}]},
+        )
 
 
     async def planner(state: State, config: RunnableConfig):
@@ -82,7 +149,7 @@ async def build_graph():
             + state["messages"],
             config,
         )
-        return {"plan": plan}
+        return {"plan": plan,"findings": None, "critique": None}  # reset findings and critique if re-planning
 
     async def research_llm(state: State, config: RunnableConfig):
         sub_qs = "\n".join(f"- {q}" for q in state["plan"].sub_questions)
@@ -96,7 +163,7 @@ async def build_graph():
             Address all issues identified in the previous critique.
             """
 
-        msgs = [SystemMessage(prompt)] + state["messages"]        
+        msgs = [SystemMessage(prompt)] + state["messages"] + [HumanMessage("Retify any critique if there and provide new findings.")]       
         response = await llm_with_tools.ainvoke(msgs, config)
         return {"messages": [response]}
 
@@ -106,9 +173,16 @@ async def build_graph():
         new_findings = await extractor.ainvoke(msgs, config)
         
         previous = (state["findings"].findings if state.get("findings") else [])
-        combined = Findings(findings=previous + new_findings.findings)
 
-        return {"findings": combined}
+        unique = {
+            (f.sub_question_index, f.claim, f.source_url): f
+            for f in previous + new_findings.findings
+        }
+
+        return {
+            "findings": Findings(findings=list(unique.values())),
+            "critique": None
+        }
 
     async def critic(state: State):
         issues = []
@@ -124,19 +198,26 @@ async def build_graph():
             if i not in covered:
                 issues.append(f"Sub-question {i} has no findings: {q}")
 
-        return {"critique": "\n".join(issues) or None,
+        return {"critique": "\n".join(issues) or "passed",
                 "iterations": state.get("iterations", 0) + 1}
 
-    def route_after_critic(state: State):
-        if state["critique"] and state["iterations"] < 3: 
-            return "researcher"
-        return END
+    # def route_after_critic(state: State):
+    #     if state["critique"] and state["iterations"] < 3: 
+    #         return "researcher"
+    #     return END
 
     async def writer(state: State, config: RunnableConfig):
         question = state["messages"][0].content
+        findings = state.get("findings")
+
         evidence = "\n".join(
-            f"- {f.claim} [{f.source_url}]" for f in state["findings"].findings
+            f"- {f.claim} [{f.source_url}]"
+            for f in (findings.findings if findings else [])
         )
+
+        if not evidence:
+            evidence = "No findings were collected."
+
         report = await writer_chain.ainvoke(
             [
                 SystemMessage(WRITE_PROMPT),
@@ -148,8 +229,9 @@ async def build_graph():
 
 
 
-
     builder = StateGraph(State)
+
+    builder.add_node("supervisor", supervisor)
     builder.add_node("planner", planner)
     builder.add_node("researcher", research_llm)
     builder.add_node("tools", ToolNode(tools))
@@ -157,28 +239,36 @@ async def build_graph():
     builder.add_node("critic", critic)
     builder.add_node("writer", writer)
 
-    builder.add_edge(START, "planner")
-    builder.add_edge("planner", "researcher")
+    builder.add_edge(START, "supervisor")
+
+    builder.add_edge("planner", "supervisor")
+    builder.add_edge("extractor", "supervisor")
+    builder.add_edge("critic", "supervisor")
+
     builder.add_conditional_edges(
-        "researcher", tools_condition,
-        {"tools": "tools", END: "extractor"},
+        "researcher",
+        tools_condition,
+        {
+            "tools": "tools",
+            END: "extractor"
+        }
     )
+
     builder.add_edge("tools", "researcher")
-    builder.add_edge("extractor", "critic")
-    builder.add_conditional_edges(
-        "critic", route_after_critic,
-        {"researcher": "researcher", END: "writer"},
-    )
     builder.add_edge("writer", END)
+
     return builder.compile()
+
 
 
 async def main():
     graph = await build_graph()
     result = await graph.ainvoke(
         {"messages": [{"role": "user", "content": "tell me about system design"}],
-         "iterations": 0},
-        config = {"callbacks": [langfuse_handler],"recursion_limit": 25 }
+         "iterations": 0,
+         "steps": 0,
+         "decisions": []},
+        config = {"callbacks": [langfuse_handler],"recursion_limit": 50 }
     )
 
     # print(result["findings"])
